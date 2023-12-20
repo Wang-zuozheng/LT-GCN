@@ -1,7 +1,8 @@
 import os
 import time
 from typing import Tuple
-
+import numpy as np
+import random
 import torch
 from torch.cuda.amp import GradScaler, autocast  # type: ignore
 from torch.optim import lr_scheduler
@@ -9,7 +10,7 @@ from torch.optim import lr_scheduler
 from log import logger
 from loss import SPLC
 from scpnet import SCPNetTrainer
-from utils import AverageMeter, add_weight_decay, mAP
+from utils import AverageMeter, add_weight_decay, mAP, mAP_hmt
 
 from config import cfg  # isort:skip
 
@@ -38,11 +39,12 @@ def validate(trainer, epoch: int) -> Tuple[float, bool]:
         # compute output
         with torch.no_grad():
             with autocast():
+                cfg.model_name = ''
                 if cfg.model_name != 'simsiam':
                     output_regular = sigmoid(
-                        trainer.model(input.cuda())).cpu()
+                        trainer.model(input.cuda(), type='val')).cpu()
                     output_ema = sigmoid(
-                        trainer.ema.module(input.cuda())).cpu()
+                        trainer.ema.module(input.cuda(), type='val')).cpu()
                 else:
                     output_regular = sigmoid(
                         trainer.model.module.clip(
@@ -59,9 +61,14 @@ def validate(trainer, epoch: int) -> Tuple[float, bool]:
     mAP_score_regular = mAP(
         torch.cat(targets).numpy(),
         torch.cat(preds_regular).numpy())
+    mAP_hmt(torch.cat(targets).numpy(),
+        torch.cat(preds_regular).numpy())
     mAP_score_ema = mAP(
         torch.cat(targets).numpy(),
         torch.cat(preds_ema).numpy())
+    mAP_hmt(torch.cat(targets).numpy(),
+        torch.cat(preds_ema).numpy())
+    
     logger.info("mAP score regular {:.2f}, mAP score EMA {:.2f}".format(
         mAP_score_regular, mAP_score_ema))
     mAP_max = max(mAP_score_regular, mAP_score_ema)
@@ -74,12 +81,15 @@ def validate(trainer, epoch: int) -> Tuple[float, bool]:
     return mAP_max, if_ema_better
 
 def train(trainer) -> None:
+    
     # set optimizer
     criterion = SPLC()
     parameters = add_weight_decay(trainer.model, cfg.weight_decay)
+    logger.info("lr:{}".format(cfg.lr))
+    logger.info("gcn_lr:{}".format(cfg.gcn_lr))
     max_lr = [cfg.lr, cfg.lr, cfg.gcn_lr, cfg.gcn_lr]
     optimizer = torch.optim.Adam(
-        params=parameters, lr=cfg.lr,
+        params=parameters, lr=cfg.lr, 
         weight_decay=0)  # true wd, filter_bias_and_bn
     steps_per_epoch = len(trainer.train_loader)
     scheduler = lr_scheduler.OneCycleLR(  # type: ignore
@@ -102,6 +112,7 @@ def train(trainer) -> None:
             scaler.scale(loss).backward()  # type: ignore
             scaler.step(optimizer)
             scaler.update()
+            # optimizer.step()
             scheduler.step()
             trainer.ema.update(trainer.model)
             if i % 100 == 0:
@@ -109,13 +120,13 @@ def train(trainer) -> None:
                     .format(epoch, cfg.epochs, str(i).zfill(3), str(steps_per_epoch).zfill(3), # noqa
                             scheduler.get_last_lr()[0], \
                             loss.item()))
-
+        # scheduler.step()
         mAP_score, if_ema_better = validate(trainer, epoch)
 
         if mAP_score > highest_mAP:
             highest_mAP = mAP_score
             best_epoch = epoch
-            save_best(trainer, if_ema_better)
+            # save_best(trainer, if_ema_better)
         logger.info(
             'current_mAP = {:.2f}, highest_mAP = {:.2f}, best_epoch={}\n'.
             format(mAP_score, highest_mAP, best_epoch))
@@ -123,8 +134,12 @@ def train(trainer) -> None:
 
 def test(trainer) -> None:
     # get model-highest.ckpt
-    trainer.model.load_state_dict(
-        torch.load(f"{cfg.checkpoint}/model-highest.ckpt"), strict=True)
+    # trainer.model.load_state_dict(
+    #     torch.load(f"{cfg.checkpoint}/model-highest.ckpt"), strict=True)
+    # BEST
+    # trainer.model.load_state_dict(
+    #     torch.load(f"checkpoints/scpnet+voc+lt/round1/model-highest.ckpt"), strict=True)
+    
     trainer.model.eval()
 
     logger.info("Start test...")
@@ -134,17 +149,21 @@ def test(trainer) -> None:
     # mAP_meter = AverageMeter()
 
     sigmoid = torch.nn.Sigmoid()
-
+    softmax = torch.nn.Softmax()
     end = time.time()
     tp, fp, fn, tn, count = 0, 0, 0, 0, 0
     preds = []
     targets = []
     for i, (input, target) in enumerate(trainer.val_loader):
         target = target
+        
         # compute output
         with torch.no_grad():
             output = sigmoid(trainer.model(input.cuda())).cpu()
-
+            
+        # with torch.no_grad():
+        #     output = softmax(trainer.model(input.cuda())).cpu()
+        
         # for mAP calculation
         preds.append(output.cpu())
         targets.append(target.cpu())
@@ -220,12 +239,24 @@ def test(trainer) -> None:
                 f_o))  # type: ignore
 
     mAP_score = mAP(torch.cat(targets).numpy(), torch.cat(preds).numpy())
+    mAP_hmt(torch.cat(targets).numpy(), torch.cat(preds).numpy())
     logger.info(f"mAP score: {mAP_score}")
     return torch.cat(targets).numpy(), torch.cat(preds).numpy()  # type: ignore
 
 
 
 def main():
+    seed = 0
+    print("Setting fixed seed: {}".format(seed))
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     trainer = SCPNetTrainer()
     if cfg.test:
         test(trainer)

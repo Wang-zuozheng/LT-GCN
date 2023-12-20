@@ -1,0 +1,22 @@
+dataset: ./dataset/coco_lt_train.txt
+val_dataset: ./dataset/voc_lt_val.txt
+data: /home/wzz/COCO
+num_classes: 80
+n_ctx: 4
+checkpoint: scpnet+coco+lt
+ctx_init: a photo of a
+log_file: scpnet+coco.txt
+epochs: 16 #60
+total_epochs: 120
+lr: 3e-5
+lambda_u: 0.15
+p_cutoff: 0.95
+hard_k: 2
+kl_lambda: 1
+T: 0.2
+sparse_topk: 80
+reweight_p: 0
+gcn_lr: 1e-3
+relation_file: relation+coco.npy
+ratio: 1
+scale: 10

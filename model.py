@@ -1,9 +1,9 @@
 from collections import OrderedDict
-
+import mmcv
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+from clip.model import build_model_conv_proj
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from config import cfg
@@ -13,6 +13,7 @@ _tokenizer = _Tokenizer()
 
 def load_clip_to_cpu():
     backbone_name = 'RN50'
+    # backbone_name = 'ViT-B/16'
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
 
@@ -26,6 +27,7 @@ def load_clip_to_cpu():
         state_dict = torch.load(model_path, map_location="cpu")
 
     model = clip.build_model(state_dict or model.state_dict())  # type: ignore
+    # model = build_model_conv_proj(state_dict or model.state_dict(), cfg)
 
     return model
 
@@ -158,7 +160,7 @@ class GraphConvolution(nn.Module):
                + str(self.in_features) + ' -> ' \
                + str(self.out_features) + ')'
 
-from timm.models.vision_transformer import resize_pos_embed
+# from timm.models.vision_transformer import resize_pos_embed
 class SCPNet(nn.Module):
 
     def __init__(self, classnames, clip_model):
@@ -169,13 +171,28 @@ class SCPNet(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
-
+        self.num_class = cfg.num_classes 
+        self.q_fc = nn.Sequential(nn.Linear(1024, 1024), nn.ReLU(), nn.Linear(1024, 1024))
+        self.k_fc = nn.Sequential(nn.Linear(1024, 1024), nn.ReLU(), nn.Linear(1024, 1024))
+        self.pro = torch.zeros(self.num_class, 1024)
+        
         self.gc1 = GraphConvolution(1024, 2048)
         self.gc2 = GraphConvolution(2048, 2048)
         self.gc3 = GraphConvolution(2048, 1024)
         self.relu = nn.LeakyReLU(0.2)
         self.relu2 = nn.LeakyReLU(0.2)
-       
+        
+        # self.q_fc = nn.Sequential(nn.Linear(512, 512), nn.ReLU(), nn.Linear(512, 512))
+        # self.k_fc = nn.Sequential(nn.Linear(512, 512), nn.ReLU(), nn.Linear(512, 512))
+        # self.pro = torch.zeros(self.num_class, 512)
+        
+        # self.gc1 = GraphConvolution(512, 1024)
+        # self.gc2 = GraphConvolution(1024, 1024)
+        # self.gc3 = GraphConvolution(1024, 512)
+        # self.relu = nn.LeakyReLU(0.2)
+        # self.relu2 = nn.LeakyReLU(0.2)
+        
+        # self.relation = torch.Tensor(np.load('data_x.npy'))
         self.relation = torch.Tensor(np.load(cfg.relation_file))
         
         _ ,max_idx = torch.topk(self.relation, cfg.sparse_topk)
@@ -195,11 +212,125 @@ class SCPNet(nn.Module):
         self.relation[sparse_mask] = 0
         self.relation = self.relation / torch.sum(self.relation, dim=1).reshape(-1, 1)
 
-    def forward(self, image):
+    def forward(self, image, type='train', gt_labels=None):
         tokenized_prompts = self.tokenized_prompts
         image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1,
-                                                              keepdim=True)
+        
+        if type == 'train':
+            num_lb = image_features.shape[0] // 3
+            image_features_lb = image_features[:num_lb]
+            image_features_ulb_w, image_features_ulb_s = image_features[num_lb:].chunk(2)
+            
+            
+            label_pro = torch.eye(self.num_class)
+            
+            
+            pro = self.k_fc(image_features_lb) 
+            pro = torch.mm(torch.mm(torch.linalg.pinv(torch.mm(gt_labels.T.float(), gt_labels.float()).float()), gt_labels.T.float()), pro.float()).cpu()
+            self.pro = 0.99 * self.pro + (1 - 0.99) * pro
+            pro = nn.functional.normalize(self.pro, dim=1)
+            
+            q = self.q_fc(image_features_ulb_s)
+            q = nn.functional.normalize(q, dim=1)
+            
+            k = self.q_fc(image_features_ulb_w)
+            k = nn.functional.normalize(k, dim=1)
+            
+            image_features = image_features / image_features.norm(dim=-1,
+                                                                keepdim=True)
+            
+            features = torch.cat((q, k, pro.cuda().detach()), dim=0)#, self.queue.clone().detach().t()
+            labels = torch.cat((gt_labels, gt_labels, label_pro.cuda().detach()), dim=0)# 576,20, self.label_queue.clone().detach()
+            batch_size = gt_labels.shape[0]
+            longth = 2*batch_size + self.num_class    
+            
+            # 无监督学习的mask
+            mask = torch.zeros((batch_size, longth)).cuda()
+            for i in range(batch_size):
+                mask[i, i+batch_size] = 1
+                
+            # label之间的相似度
+            and_min = torch.matmul(gt_labels.int().cpu(),labels.T.int().cpu()) # 与操作
+            or_max = (gt_labels.sum(1).repeat(longth,1).T + labels.sum(1)).cpu()-and_min  # 或操作 32,576 + 576,1 
+            sim =  and_min/or_max # 完全一致为1
+            
+            thr = 0 #0.5
+            mask_pos = torch.where(sim >= thr , sim, 0).cuda()
+            
+            mask_neg = torch.where(mask_pos==1, mask_pos,  1 - mask_pos)
+            # 不同类别设置不同T
+            class_split = mmcv.load('/home/wzz/new/DistributionBalancedLoss/appendix/VOCdevkit/longtail2012/class_split.pkl')
+            # class_split = mmcv.load('/home/wzz/new/DistributionBalancedLoss/appendix/coco/longtail2017/class_split.pkl')
+            M_index = gt_labels[:,list(class_split['middle'])].sum(1)
+            M_index = torch.sign(M_index) 
+            mask_m = torch.unsqueeze(M_index, dim=1)
+            mask_m = mask_m.repeat(1,longth)
+            T_index = gt_labels[:,list(class_split['tail'])].sum(1)
+            T_index = torch.sign(T_index) 
+            mask_tail = torch.unsqueeze(T_index, dim=1) 
+            
+            mask_tail = mask_tail.repeat(1,longth) 
+            mask_m -= mask_tail     
+            mask_m = torch.where(mask_m<0,0,mask_m)
+            # compute logits
+            anchor_dot_contrast_head = (1-mask_tail-mask_m) * torch.div(
+                torch.matmul(features[:batch_size], features.T),
+                0.7)#1.0
+            anchor_dot_contrast_middle = (mask_m) * torch.div(
+                torch.matmul(features[:batch_size], features.T),
+                0.7)#1.0
+            anchor_dot_contrast_tail = mask_tail * torch.div(
+                torch.matmul(features[:batch_size], features.T),
+                0.7)# 0.3
+            anchor_dot_contrast = anchor_dot_contrast_head +anchor_dot_contrast_tail+anchor_dot_contrast_middle
+            # compute logits负
+            logits = anchor_dot_contrast
+            
+            logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+            logits = logits - logits_max.detach()
+            
+            # compute logits正
+            anchor_dot_contrast_pos = torch.div(
+                torch.matmul(features[:batch_size], features.T),
+                0.7)#0.5
+            logits_pos = anchor_dot_contrast_pos
+            logits_max, _ = torch.max(logits_pos, dim=1, keepdim=True)
+            logits_pos = logits_pos - logits_max.detach()
+            
+            logits_mask = torch.scatter(
+                torch.ones_like(mask),
+                1,
+                torch.arange(batch_size).view(-1, 1).cuda(),
+                0
+            ).cuda()
+
+            mask = mask * logits_mask# 无监督的mask
+            
+            mask_pos = mask_pos * logits_mask# 有监督的 多标记的mask
+            miu = 1
+            mask = torch.where(mask==1, mask, miu * mask_pos)
+            
+            per_ins_weight = labels.sum(0)
+            
+            balanced_neg_weight = []
+            for i in range(batch_size):
+                per_ins_weight_i = (mask_neg[i].unsqueeze(1).repeat(1,self.num_class) * labels).sum(0)
+                sample_per_balanced_neg_weight = list((labels / (per_ins_weight_i)).sum(1)) 
+                balanced_neg_weight.append(sample_per_balanced_neg_weight)
+            # 对比损失 
+            # compute log_prob
+            exp_logits = torch.exp(logits) * logits_mask  * mask_neg
+            # exp_logits = torch.exp(logits* ((labels / (per_ins_weight+1)).sum(1))) * logits_mask
+            # exp_logits = exp_logits * ((labels / (per_ins_weight+1)).sum(1))
+            exp_logits = exp_logits * torch.tensor(balanced_neg_weight).cuda()
+            log_prob = logits_pos - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12) # 32, 576 - 32, 1
+
+            # compute mean of log-likelihood over positive
+            mean_log_prob_pos = - (mask * log_prob).sum(1) / mask.sum(1)
+            
+            
+            ss_loss = mean_log_prob_pos
+        
         logit_scale = self.logit_scale.exp()
         if cfg.scale != 'clip':
             assert(isinstance(cfg.scale, int))
@@ -213,9 +344,35 @@ class SCPNet(nn.Module):
         text_features = self.gc2(text_features, self.gcn_relation.cuda())
         text_features = self.relu2(text_features)
         text_features = self.gc3(text_features, self.gcn_relation.cuda())
+        b = 1
+        text_features = b * text_features + identity
         
-        text_features += identity
+        # text_features = identity
+        
+        # class_split = mmcv.load('/home/wzz/new/DistributionBalancedLoss/appendix/VOCdevkit/longtail2012/class_split.pkl')
+        # # class_split = mmcv.load('/home/wzz/new/DistributionBalancedLoss/appendix/coco/longtail2017/class_split.pkl')
+        # mask_tail_feature = torch.zeros(text_features.shape[0], text_features.shape[1])
+        # for i in class_split['tail']:
+        #     mask_tail_feature[i, :] = text_features[i, :]
+        # text_features = identity + mask_tail_feature.cuda()
+        
+        image_features= image_features / image_features.norm(dim=-1,
+                                                                keepdim=True)    
         text_features = text_features / text_features.norm(dim=-1,
                                                             keepdim=True)
         logits = logit_scale * image_features @ text_features.t()
-        return logits
+        
+        # # Class-Specific Region Feature Aggregation
+        # output = F.conv1d(image_features, text_features[:, :, None])#8 80 50
+      
+        # # WTA
+        # # wi = F.softmax(1 * output * torch.max(output, dim=1)[0].unsqueeze(1))
+        # # output = torch.mul(wi, output)
+        # w = F.softmax(output, dim=-1)# 8 20 50 softmax(Si,m+) 
+       
+        # logits =  logit_scale * (w * output).sum(-1)#output是 Si,m+ Si,m- 是局部Fi 和Ft的余弦相似度
+
+        if type == 'train':
+            return logits, ss_loss.sum()
+        else:
+            return logits

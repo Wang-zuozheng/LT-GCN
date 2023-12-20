@@ -10,8 +10,9 @@ from torchvision import transforms
 from config import cfg
 from log import logger
 from model import SCPNet, load_clip_model
-from utils import COCO_missing_val_dataset, CocoDetection, ModelEma, get_ema_co
-
+from utils import COCO_missing_val_dataset, CocoDetection, ModelEma, get_ema_co, CustomDataset
+from asl import *
+from dbl import ResampleLoss
 from randaugment import RandAugment
 
 
@@ -38,9 +39,20 @@ class WeakStrongDataset(torch.utils.data.Dataset):  # type: ignore
 
     def __getitem__(self, index):
         name = self.name[index]
-        path = name.strip('\n').split(',')[0]
-        num = name.strip('\n').split(',')[1]
-        num = num.strip(' ').split(' ')
+        
+        # path = name.strip('\n').split(',')[0]
+        # num = name.strip('\n').split(',')[1]
+        # num = num.strip(' ').split(' ')
+        
+        temp = name.strip('\n').split(' ')
+        path = temp[0]
+        if 'COCO' in self.root:
+            num = temp[1: len(temp)-1]
+        elif 'voc' in self.root:
+            num = temp[1: ]
+        else:
+            ValueError
+        
         num = np.array([int(i) for i in num])
         label = np.zeros([self.class_num])
         label[num] = 1
@@ -62,15 +74,16 @@ class WeakStrongDataset(torch.utils.data.Dataset):  # type: ignore
 def build_weak_strong_dataset(train_preprocess,
                               val_preprocess,
                               pin_memory=True):
-    if "coco" in cfg.data:
-        return build_coco_weak_strong_dataset(train_preprocess, val_preprocess)
+    if "COCO" in cfg.data:
+        return build_coco_weak_strong_dataset(train_preprocess, val_preprocess), True
     elif "nuswide" in cfg.data:
         return build_nuswide_weak_strong_dataset(train_preprocess,
-                                                 val_preprocess)
+                                                 val_preprocess), True
     elif "voc" in cfg.data:
-        return build_voc_weak_strong_dataset(train_preprocess, val_preprocess)
+        return build_voc_weak_strong_dataset(train_preprocess, val_preprocess), True
     elif "cub" in cfg.data:
-        return build_cub_weak_strong_dataset(train_preprocess, val_preprocess)
+        return build_cub_weak_strong_dataset(train_preprocess, val_preprocess), True
+    
     else:
         assert (False)
 
@@ -79,12 +92,15 @@ def build_coco_weak_strong_dataset(train_preprocess, val_preprocess):
 
     # COCO Data loading
     instances_path_val = os.path.join(cfg.data,
-                                      'annotations/instances_val2014.json')
+                                      'annotations/instances_val2017.json')
     # instances_path_train = os.path.join(args.data, 'annotations/instances_train2014.json')
     instances_path_train = cfg.dataset
+    
+    # instances_path_train = cfg.train_dataset
+    # instances_path_val = cfg.val_dataset
 
-    data_path_val = f'{cfg.data}/val2014'  # args.data
-    data_path_train = f'{cfg.data}/train2014'  # args.data
+    data_path_val = f'{cfg.data}/val2017'  # args.data
+    data_path_train = f'{cfg.data}/train2017'  # args.data
     val_dataset = CocoDetection(data_path_val, instances_path_val,
                                 val_preprocess)
     train_dataset = WeakStrongDataset(data_path_train,
@@ -141,12 +157,44 @@ def build_nuswide_weak_strong_dataset(train_preprocess, val_preprocess):
     return [train_loader, val_loader]
 
 
-def build_voc_weak_strong_dataset(train_preprocess, val_preprocess):
+def build_voc_lt_dataset(train_preprocess, val_preprocess):
     # VOC Data loading
     instances_path_train = cfg.train_dataset
     instances_path_val = cfg.val_dataset
 
     data_path_val = f'{cfg.data}VOC2012/JPEGImages'  # args.data
+    data_path_train = f'{cfg.data}VOC2012/JPEGImages'  # args.data
+    dataset = 'voc-lt'
+    val_dataset = CustomDataset(
+        dataset=dataset, 
+        preprocess=val_preprocess,
+        split='test'
+        )
+    train_dataset = CustomDataset(
+        dataset=dataset, 
+        preprocess=train_preprocess,
+        split='train'
+        )
+    # Pytorch Data loader
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=cfg.batch_size,
+                                               shuffle=True,
+                                               num_workers=cfg.workers,
+                                               pin_memory=True)
+
+    val_loader = torch.utils.data.DataLoader(val_dataset,
+                                             batch_size=cfg.batch_size,
+                                             shuffle=False,
+                                             num_workers=cfg.workers,
+                                             pin_memory=False)
+    return [train_loader, val_loader]
+
+def build_voc_weak_strong_dataset(train_preprocess, val_preprocess):
+    # VOC Data loading
+    instances_path_train = cfg.train_dataset
+    instances_path_val = cfg.val_dataset
+
+    data_path_val = f'{cfg.data}VOC2007/JPEGImages'  # args.data
     data_path_train = f'{cfg.data}VOC2012/JPEGImages'  # args.data
 
     val_dataset = COCO_missing_val_dataset(data_path_val,
@@ -170,7 +218,6 @@ def build_voc_weak_strong_dataset(train_preprocess, val_preprocess):
                                              num_workers=cfg.workers,
                                              pin_memory=False)
     return [train_loader, val_loader]
-
 
 def build_cub_weak_strong_dataset(train_preprocess, val_preprocess):
     # CUB Data loading
@@ -207,7 +254,7 @@ class SCPNetTrainer():
     def __init__(self) -> None:
         super().__init__()
 
-        clip_model, _ = load_clip_model()
+        # bulid dataloader
         # image_size = clip_model.visual.input_resolution
         image_size = cfg.image_size
 
@@ -224,22 +271,33 @@ class SCPNetTrainer():
             transforms.CenterCrop(image_size),
             transforms.ToTensor(), normalize
         ])
-
-        train_loader, val_loader = build_weak_strong_dataset(
+        
+        normalize = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+       
+        loader, flag = build_weak_strong_dataset(
             train_preprocess,  # type: ignore
             val_preprocess)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.train_loader = loader[0]
+        self.val_loader = loader[1]
 
-        classnames = val_loader.dataset.labels()
+        if flag:
+            classnames = self.val_loader.dataset.labels()
+        else:
+            classnames = []
+            for item in loader[1].dataset.categories:
+                classnames.append(item['name'])
         assert (len(classnames) == cfg.num_classes)
 
+        # build model
+        clip_model, _ = load_clip_model()
         self.model = SCPNet(classnames, clip_model)
         self.relation = self.model.relation
         self.classnames = classnames
         for name, param in self.model.named_parameters():
             if "text_encoder" in name:
                 param.requires_grad_(False)
+            # if "prompt_learner" not in name:
+            #     param.requires_grad = False
 
         self.model.cuda()
         ema_co = get_ema_co()
@@ -253,38 +311,37 @@ class SCPNetTrainer():
         self.classwise_acc = torch.zeros((cfg.num_classes, )).cuda()
         self.classwise_acc[:] = 1/cfg.num_classes
 
-    def consistency_loss(self, logits_s, logits_w, y_lb):
+    def consistency_loss(self, logits_s, logits_w, y_lb, weight):
         logits_w = logits_w.detach()
 
         pseudo_label = torch.sigmoid(logits_w)
         pseudo_label_s = torch.sigmoid(logits_s)
 
         relation_p = pseudo_label @ self.relation.cuda().t()
-
-        max_probs, max_idx = torch.topk(pseudo_label, cfg.hard_k, dim=-1)
-        threhold = cfg.p_cutoff * (self.classwise_acc[max_idx] /
-                                    (2. - self.classwise_acc[max_idx]))
-        mask = max_probs.ge(threhold).float().sum(dim=1) >= 1  # convex
-        labels = torch.zeros((len(logits_s), cfg.num_classes),
-                                dtype=torch.long)
-        for i, idx in enumerate(max_idx):
-            labels[i][idx] = 1
-        labels_mask = pseudo_label < cfg.p_cutoff * (
-            self.classwise_acc / (2. - self.classwise_acc))
-        labels[labels_mask] = 0
-        labels = torch.logical_or(labels, y_lb.cpu()).type(torch.long)
-        labels = labels.cuda()
+        pos_mask = relation_p * y_lb
+        neg_mask = (1-relation_p) * (1 - y_lb)
+        mask_probs = pos_mask + neg_mask
+        import mmcv 
+        freq_file ='/home/wzz/LMPT/data/coco/class_freq.pkl'
+        temp = torch.from_numpy(np.asarray(mmcv.load(freq_file)['class_freq'])).to(torch.float32).cuda()
+        weight =  (1 / temp) ** 1 / torch.sum((1 / temp) ** 1)        
+        pos_mask_s = pseudo_label_s * y_lb
+        neg_mask_s = (1-pseudo_label_s) * (1 - y_lb)
+        mask_probs_s = pos_mask_s + neg_mask_s
+        # from sklearn.metrics import average_precision_score, roc_auc_score
+        # from utils import average_precision
+        mask = mask_probs.ge(0.5).float().sum(dim=1) >= mask_probs_s.ge(0.5).float().sum(dim=1)  # convex 样本中有其中一个类大于阈值时，则选中样本
+        # a = roc_auc_score(np.array(y_lb.cpu()), np.array(relation_p.cpu()), average=None)
         xs_pos = pseudo_label_s
         xs_neg = 1 - pseudo_label_s
-        los_pos = labels * torch.log(xs_pos.clamp(min=1e-8))
-        los_neg = (1 - labels) * torch.log(xs_neg.clamp(min=1e-8))
-        loss = (los_pos + los_neg) * mask.reshape(-1, 1)
-        loss_kl = (relation_p * torch.log(xs_pos.clamp(min=1e-8)) + (1 - relation_p) * torch.log(xs_neg.clamp(min=1e-8))) * mask.reshape(-1, 1)
-        return -loss.sum() - cfg.kl_lambda * loss_kl.sum(), labels
+        loss_kl = weight * (relation_p * torch.log(xs_pos.clamp(min=1e-8)) + (1 - relation_p) * torch.log(xs_neg.clamp(min=1e-8))) * mask.reshape(-1, 1)
+        return  - cfg.kl_lambda * loss_kl.sum() #-loss.sum()
+
 
     def train(self, input, target, criterion, epoch, epoch_i) -> torch.Tensor:
         
         x_ulb_idx, x_lb, x_ulb_w, x_ulb_s = input
+        # x_lb, x_ulb_w, x_ulb_s = input
         y_lb = target
 
         num_lb = x_lb.shape[0]
@@ -292,9 +349,8 @@ class SCPNetTrainer():
         assert num_ulb == x_ulb_s.shape[0]
 
         x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(), x_ulb_w.cuda(), x_ulb_s.cuda()
-        x_ulb_idx = x_ulb_idx.cuda()
-
-        pseudo_counter = self.selected_label.sum(dim=0)
+        # x_ulb_idx = x_ulb_idx.cuda()
+        pseudo_counter = self.selected_label.sum(dim=0)# shape 20
         max_v = pseudo_counter.max().item()
         sum_v = pseudo_counter.sum().item()
         if max_v >= 1:  # not all(5w) -1
@@ -307,24 +363,58 @@ class SCPNetTrainer():
 
         # inference and calculate sup/unsup losses
         with autocast():
-            logits = self.model(inputs)
+            logits, ss_loss = self.model(inputs, 'train', y_lb)
+            # logits = self.model(x_lb)
+            # logits_s = logits
+            # logits_w = self.model(x_ulb_w)
+            # # logits_s = self.model(x_ulb_s)
+            # logits = torch.cat((logits, logits_w, logits_s))
+            
             logits_x_lb = logits[:num_lb]
             logits_x_ulb_w, logits_x_ulb_s = logits[num_lb:].chunk(2)
         logits_x_lb = logits_x_lb.float()
         logits_x_ulb_w, logits_x_ulb_s = logits_x_ulb_w.float(
         ), logits_x_ulb_s.float()
+        
+        
+        
+        # sup_loss, _ = criterion(logits_x_lb, y_lb, epoch)
+        
+        
+        
+        
+        
+        # freq_file='/home/wzz/LMPT/data/voc/class_freq.pkl'
+        # loss_function = ResampleLoss(
+        #         use_sigmoid=True,
+        #         reweight_func='rebalance',
+        #         focal=dict(focal=True, balance_param=2.0, gamma=2),
+        #         logit_reg=dict(neg_scale=5.0, init_bias=0.05),
+        #         map_param=dict(alpha=0.1, beta=10.0, gamma=0.3),
+        #         loss_weight=1.0, freq_file=freq_file
+        #     )
+        
+        freq_file = '/home/wzz/LMPT/data/coco/class_freq.pkl'
+        loss_function = ResampleLoss(
+                use_sigmoid=True,
+                reweight_func='rebalance',
+                focal=dict(focal=True, balance_param=2.0, gamma=2),
+                logit_reg=dict(neg_scale=2.0, init_bias=0.05),
+                map_param=dict(alpha=0.1, beta=10.0, gamma=0.2),
+                loss_weight=1.0, freq_file=freq_file
+            )
+        cls_loss, weight_label = loss_function(logits_x_lb, y_lb)
+        
+        unsup_loss = self.consistency_loss(logits_x_ulb_s,
+                                                   logits_x_ulb_w, y_lb, weight_label)
+        # loss_asl = ASLloss()(logits_x_lb, y_lb)
+        
+        # assert (labels is not None)
+        # select_mask = labels.sum(dim=1) >= 1
+        # if x_ulb_idx[select_mask].nelement() != 0:
+        #     self.selected_label[
+        #         x_ulb_idx[select_mask]] = labels[select_mask]
 
-        sup_loss, _ = criterion(logits_x_lb, y_lb, epoch)
-
-        unsup_loss, labels = self.consistency_loss(logits_x_ulb_s,
-                                                   logits_x_ulb_w, y_lb)
-
-        assert (labels is not None)
-        select_mask = labels.sum(dim=1) >= 1
-        if x_ulb_idx[select_mask].nelement() != 0:
-            self.selected_label[
-                x_ulb_idx[select_mask]] = labels[select_mask]
-
-        total_loss = sup_loss + cfg.lambda_u * unsup_loss
-
-        return total_loss
+        total_loss = cls_loss + unsup_loss
+        
+        return total_loss #+ cfg.lambda_u * ()

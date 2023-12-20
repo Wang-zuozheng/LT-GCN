@@ -50,6 +50,24 @@ def mAP(targs, preds):
         ap[k] = average_precision(scores, targets)
     return 100 * ap.mean()
 
+def mAP_hmt(targs, preds):
+    import mmcv
+    class_freq = np.asarray(mmcv.load('/home/wzz/LMPT/data/voc/class_freq.pkl')['class_freq'])
+    hids = list(np.where(class_freq>=100)[0])
+    mids = list(np.where((class_freq<100) * (class_freq >= 20))[0])
+    tids = list(np.where(class_freq<20)[0])
+    
+    if np.size(preds) == 0:
+        return 0
+    ap = np.zeros((preds.shape[1]))
+    # compute average precision for each class
+    for k in range(preds.shape[1]):
+        # sort scores
+        scores = preds[:, k]
+        targets = targs[:, k]
+        # compute average precision
+        ap[k] = average_precision(scores, targets)
+    logger.info(f'mAP head: {ap[hids].mean()}, mAP medium: {ap[mids].mean()}, mAP tail: {ap[tids].mean()}')
 
 class AverageMeter(object):
 
@@ -209,9 +227,16 @@ class COCO_missing_val_dataset(torch.utils.data.Dataset):  # type: ignore
 
     def __getitem__(self, index):
         name = self.name[index]
-        path = name.strip('\n').split(',')[0]
-        num = name.strip('\n').split(',')[1]
-        num = num.strip(' ').split(' ')
+        
+        # path = name.strip('\n').split(',')[0]
+        # num = name.strip('\n').split(',')[1]
+        # num = num.strip(' ').split(' ')
+        
+        temp = name.strip('\n').split(' ')
+        path = temp[0]
+        num = temp[1:]
+        
+        
         num = np.array([int(i) for i in num])
         label = np.zeros([self.class_num])
         label[num] = 1
@@ -251,8 +276,42 @@ class COCO_missing_val_dataset(torch.utils.data.Dataset):  # type: ignore
             return text.split('\n')
         else:
             assert (False)
+            
+from torch.utils.data import Dataset
+from imagelist import *
 
+class CustomDataset(Dataset):
+    """Dataset.
+    """
 
+    def __init__(self, dataset, preprocess, split):
+        assert dataset in ["coco-lt", "voc-lt", "voc", "nus-wide"]
+        if dataset == 'coco-lt':
+            self.data_source = ImageList(root='/home/wzz/COCO/',
+                                        list_file='/home/wzz/LMPT/data/coco/coco_lt_%s.txt' % split,
+                                        label_file='/home/wzz/LMPT/data/coco/coco_labels.txt',
+                                        transform=preprocess,
+                                        nb_classes=80,
+                                        split=split)
+        elif dataset == 'voc-lt':
+            self.data_source = ImageList(root='',
+                                        list_file='/home/wzz/LMPT/data/voc/voc_lt_%s.txt' % split,
+                                        label_file='/home/wzz/LMPT/data/voc/voc_labels.txt',
+                                        transform=preprocess,
+                                        nb_classes=20,
+                                        split=split)
+
+        self.targets = self.data_source.labels # one-hot label
+        self.categories = self.data_source.categories
+        self.fns = self.data_source.fns
+
+    def __len__(self):
+        return self.data_source.get_length()
+
+    def __getitem__(self, idx):
+        img, target = self.data_source.get_sample(idx)
+        return img, target
+    
 class ModelEma(torch.nn.Module):
 
     def __init__(self, model, decay=0.9997, device=None):
@@ -280,7 +339,6 @@ class ModelEma(torch.nn.Module):
 
     def set(self, model):
         self._update(model, update_fn=lambda e, m: m)
-
 
 class CutoutPIL(object):
 
@@ -320,7 +378,7 @@ def add_weight_decay(model, weight_decay=1e-4, skip_list=()):
                 gcn_no_decay.append(param)
             else:
                 gcn.append(param)
-            assert("gcn" in cfg.model_name)
+            # assert("gcn" in cfg.model_name)
         elif len(param.shape) == 1 or name.endswith(
                 ".bias") or name in skip_list:
             no_decay.append(param)
@@ -341,14 +399,14 @@ def add_weight_decay(model, weight_decay=1e-4, skip_list=()):
     }]
 
 def get_ema_co():
-    if "coco" in cfg.data:
+    if "COCO" in cfg.data:
         ema_co = np.exp(np.log(0.82)/(641*cfg.ratio))  # type: ignore
         # ema_co = 0.9997
     elif "nus" in cfg.data:
         ema_co = np.exp(np.log(0.82)/(931*cfg.ratio))  # type: ignore
         # ema_co = 0.9998
     elif "voc" in cfg.data:
-        ema_co = np.exp(np.log(0.82)/(45*cfg.ratio))  # type: ignore
+        ema_co = np.exp(np.log(0.82)/(90*cfg.ratio))  # type: ignore
         # ema_co = 0.9956
     elif "cub" in cfg.data:
         if cfg.batch_size == 96:
@@ -357,4 +415,5 @@ def get_ema_co():
             ema_co = np.exp(np.log(0.82)/(47*cfg.ratio))  # type: ignore
     else:
         assert(False)
+    logger.info("EMA_co:{}".format(ema_co))
     return ema_co

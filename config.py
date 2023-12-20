@@ -5,7 +5,7 @@ from omegaconf import OmegaConf
 from args import args
 
 # Base config
-base_cfg = OmegaConf.load('configs/base.yaml')
+base_cfg = OmegaConf.load('configs/scpnet+coco+lt.yaml')
 
 # Main Config
 main_cfg = OmegaConf.load(args.config_file)
@@ -28,7 +28,7 @@ else:
 
 if not args.test:
     cfg.checkpoint = f"{cfg.checkpoint}/round{next_index}"
-    assert (not os.path.exists(cfg.checkpoint))
+    # assert (not os.path.exists(cfg.checkpoint))
     cfg.test = False
 else:
     cfg.checkpoint = f"{cfg.checkpoint}/round{args.round}"
